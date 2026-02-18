@@ -1,6 +1,6 @@
-from dmtest.assertions import assert_string_in
+from dmtest.assertions import assert_matches, assert_string_in
 from dmtest.vdo.utils import standard_vdo, standard_stack
-from dmtest.utils import get_dmesg_log, wipe_device
+from dmtest.utils import get_dmesg_log, trash_device
 import logging as log
 import time
 
@@ -52,8 +52,8 @@ def t_corrupt_geometry(fix):
     with standard_vdo(fix) as vdo:
         pass
     start_time = time.time()
-    # Trash just one (4kB) block
-    wipe_device(fix.cfg["data_dev"], 8)
+    # Overwrite just one (4kB) block with random data
+    trash_device(fix.cfg["data_dev"], 8)
     stack = standard_stack(fix, format = False)
     started = False
     try:
@@ -62,7 +62,7 @@ def t_corrupt_geometry(fix):
     except:
         message = get_dmesg_log(start_time)
         log.info(message)
-        assert_string_in(message, "Could not load geometry block")
+        assert_matches(message, r"Could not (load|parse) geometry block")
     if started:
         raise AssertionError("VDO device shouldn't have started")
 

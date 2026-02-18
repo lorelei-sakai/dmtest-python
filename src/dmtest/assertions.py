@@ -28,3 +28,10 @@ def assert_string_in(actual, expected, message=None):
         error_message = f"{message}: " if message else ""
         error_message += f"expected '{expected}', but got {actual}"
         raise AssertionError(error_message)
+
+def assert_matches(actual, pattern, message=None):
+    import re
+    if not re.search(pattern, actual):
+        error_message = f"{message}: " if message else ""
+        error_message += f"expected match for '{pattern}', but got {actual}"
+        raise AssertionError(error_message)

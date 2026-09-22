@@ -11,9 +11,12 @@ import re
 import threading
 import time
 
+import dmtest.pool_stack as ps
+import dmtest.process as process
 import dmtest.utils as utils
 import dmtest.vdo.stats as stats
 import dmtest.vdo.status as status
+import dmtest.tvm as tvm
 from dmtest.assertions import assert_equal, assert_matches, assert_raises
 from dmtest.device_mapper import dev as dmdev
 from dmtest.device_mapper import table, targets
@@ -21,8 +24,9 @@ from dmtest.device_mapper.dev import Dev
 from dmtest.fixture import Fixture
 from dmtest.gendatablocks import make_block_range
 from dmtest.test_register import TestRegister
+from dmtest.thin.utils import standard_pool
 from dmtest.units import SECTOR_SIZE
-from dmtest.vdo.utils import BLOCK_SIZE, fsync, run_fio, wait_for_index
+from dmtest.vdo.utils import BLOCK_SIZE, GB, MB, fsync, run_fio, wait_for_index
 from dmtest.vdo.vdo_stack import VDOStack
 
 
@@ -32,7 +36,7 @@ def write_recovery_data(vdo: Dev, tag: str, block_size: int = BLOCK_SIZE) -> Non
 
     # This write should fail due to error target introduction
     def write_data():
-        run_fio(vdo, offset=40 * 1024 * 1024, compression=55, duration=5, size=0)
+        run_fio(vdo, offset=40 * MB, compression=55, duration=5, size=0)
 
     assert_raises(write_data)
 
@@ -327,6 +331,134 @@ def t_512_recovery(fix: Fixture) -> None:
                      f"logical blocks: {stats_after['logicalBlocksUsed']}")
 
 
+def recover_from_patterns(pool: Dev, base_id: int, size: int,
+                          prerecovery_data: Any, patterns: list[int]) -> None:
+    """
+    Apply torn write pattern to the recovery journal, then recover VDO.
+    """
+
+    # The first sector of block 29 in the recovery journal, assuming that
+    # the VDO size is 40 GB (POOL_SIZE).
+    LAST_FULL_RJ_BLOCK = 41680616
+    next_id = base_id
+
+    for pattern in patterns:
+        next_id += 1
+        with ps.new_snap(pool, size, next_id, base_id) as snap:
+            log.info(f"Testing pattern {pattern:08b}")
+            for sector in range(8):
+                if (pattern >> (7 - sector)) & 1:
+                    # This calculation depends on the size and parameters of the
+                    # VDO volume, as well as the amount of data written
+                    address = LAST_FULL_RJ_BLOCK + sector
+                    # Using dd on every individual sector is not very efficient
+                    log.debug(f"Trimming sector {sector}")
+                    process.run(f"dd if=/dev/urandom of={snap.path} oflag=direct "
+                                f"bs=512 count=1 oseek={address}")
+            start_time = time.time()
+
+            # Force a recovery by recreating the vdo target without formatting
+            log.info("start recovery")
+            with VDOStack(snap, format=False).activate() as vdo:
+                verify_vdo_recovery(vdo, start_time)
+                log.info(f"vdo recovery complete: {vdo.path}")
+
+                log.info("Verifying initial data")
+                prerecovery_data.update_path(vdo.path)
+                prerecovery_data.verify()
+
+                # Write new data to prove VDO is functional
+                log.info("Writing new data post-recovery to verify functionality")
+                post_blocks = make_block_range(
+                    path=vdo.path,
+                    block_size=BLOCK_SIZE,
+                    block_count=1000,
+                    offset=30000
+                )
+                post_blocks.write(tag="post", dedupe=0.1, compress=0.55, fsync=True)
+                post_blocks.verify()
+
+                stats_after = stats.vdo_stats(vdo)
+                log.info(f"vdostats after - data blocks: {stats_after['dataBlocksUsed']}, "
+                         f"logical blocks: {stats_after['logicalBlocksUsed']}")
+
+
+def t_torn_writes(fix: Fixture) -> None:
+    """
+    Test VDO recovery after losing sector-sized writes.
+    """
+    POOL_SIZE = 40 * 1024 * 1024
+    BASE_ID = 100
+
+    # No other vdo test requires a metadata device to be set so this one
+    # should not be an outlier. Split the data device into two parts.
+    base_dev = fix.cfg("data_dev")
+    vg_name = "vdo"
+    baseline = 0
+
+    vm = tvm.VM()
+    vm.add_allocation_volume(base_dev)
+    vm.add_volume(tvm.LinearVolume("metadata", POOL_SIZE))
+    vm.add_volume(tvm.LinearVolume("data", POOL_SIZE))
+
+    # Create a thin device so we can snapshot the storage state before recovery
+    with (dmdev.dev(vm.table("data")) as thin_data_dev,
+          dmdev.dev(vm.table("metadata")) as metadata_dev):
+
+        with ps.PoolStack(thin_data_dev, metadata_dev).activate() as pool:
+            with ps.new_thin(pool, POOL_SIZE, 0) as thin:
+
+                # Create and format vdo on the thin device
+                with VDOStack(thin, format=True).activate() as vdo:
+                    log.info(f"Activated vdo device: {vdo.path}")
+                    wait_for_index(vdo)
+
+                    # This initial dataset will use a bit over 23 recovery blocks.
+                    # There are 217 entries per recovery block, and we need a few entries
+                    # for block map allocations as well, about 4 per 800 data blocks.
+                    initial_blocks = make_block_range(
+                        path=vdo.path,
+                        block_size=BLOCK_SIZE,
+                        block_count=5000
+                    )
+                    initial_blocks.write(tag="initial", dedupe=0.1, compress=0.55, fsync=True)
+                    initial_blocks.verify()
+                    log.info("Initial data written and verified")
+
+                    # Get stats before the failure simulation
+                    stats_before = stats.vdo_stats(vdo)
+                    log.info(f"vdostats before - data blocks: {stats_before['dataBlocksUsed']}, "
+                             f"logical blocks: {stats_before['logicalBlocksUsed']}")
+
+                    # Write enough to fill another ~7 recovery blocks.
+                    new_blocks = make_block_range(
+                        path=vdo.path,
+                        block_size=BLOCK_SIZE,
+                        block_count=1500,
+                        offset=5000
+                    )
+                    new_blocks.write(tag="new", dedupe=0.1, compress=0.55, fsync=True)
+                    new_blocks.verify()
+
+                    # This snapshot is the pre-recovery state to use as a baseline
+                    # for all the following test scenarios.
+                    with ps.new_snap(pool, POOL_SIZE, BASE_ID, 0,
+                                     pause_dev=thin, read_only=True) as baseline:
+                        log.info("Created baseline recovery snapshot")
+
+                        # Pattern 0 is a regular rebuild, which can be used for
+                        # a comparison to see how many entries were applied.
+                        # The least significant bit corresponds to the first sector,
+                        # which is the header and contains no entries.
+                        patterns = [ 0, # Baseline rebuild with no torn write
+                                     # Drop each individual sector
+                                     0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
+                                     # Drop mutiple sectors but preserve the header
+                                     0x7f, 0x15, 0x2a]
+                        recover_from_patterns(pool, BASE_ID, POOL_SIZE,
+                                              initial_blocks, patterns)
+
+
 def register(tests: TestRegister) -> None:
     tests.register_batch(
         "/vdo/recovery/",
@@ -334,5 +466,6 @@ def register(tests: TestRegister) -> None:
             ("quick_recovery", t_single_recovery),
             ("double_recovery", t_double_recovery),
             ("512_recovery", t_512_recovery),
+            ("torn_writes", t_torn_writes),
         ],
     )

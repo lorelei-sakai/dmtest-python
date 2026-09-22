@@ -1034,6 +1034,7 @@ targets = [
 executables = [
     "blockdev",
     "dmsetup",
+    "fio",
     "vdoformat",
 ]
 targets = [
@@ -1046,6 +1047,7 @@ targets = [
 executables = [
     "blockdev",
     "dmsetup",
+    "fio",
     "vdoformat",
 ]
 targets = [
@@ -1058,10 +1060,26 @@ targets = [
 executables = [
     "blockdev",
     "dmsetup",
+    "fio",
     "vdoformat",
 ]
 targets = [
     "error",
     "linear",
+    "vdo",
+]
+
+["/vdo/recovery/torn_writes"]
+executables = [
+    "blockdev",
+    "dd",
+    "dmsetup",
+    "thin_check",
+    "vdoformat",
+]
+targets = [
+    "linear",
+    "thin",
+    "thin-pool",
     "vdo",
 ]
